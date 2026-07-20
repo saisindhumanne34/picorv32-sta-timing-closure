@@ -1,5 +1,4 @@
-# picorv32-sta-timing-closure
-STA and timing closure study on PicoRV32 (Sky130, OpenLane) — constraint setup, WNS/TNS across clock periods, and closing a setup violation via synthesis strategy and placement density changes
+
 # PicoRV32 — Timing Constraints, STA & Timing Closure
 
 This repository documents a focused Static Timing Analysis (STA) and timing closure study on the PicoRV32 RISC-V core, built directly on top of the [picorv32a / OpenLane / Sky130 SoC design project](../../soc-design-and-planning-vsd). Where that project took the design from RTL to a routed GDSII, this one asks a narrower question: **at what clock speed does this design actually work, why does it fail where it fails, and can we fix it without touching the RTL?**

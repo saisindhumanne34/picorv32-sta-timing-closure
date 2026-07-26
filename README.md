@@ -1,4 +1,3 @@
-
 # PicoRV32 — Timing Constraints, STA & Timing Closure
 
 This repository documents a focused Static Timing Analysis (STA) and timing closure study on the PicoRV32 RISC-V core, built directly on top of the [picorv32a / OpenLane / Sky130 SoC design project](../../soc-design-and-planning-vsd). Where that project took the design from RTL to a routed GDSII, this one asks a narrower question: **at what clock speed does this design actually work, why does it fail where it fails, and can we fix it without touching the RTL?**
@@ -26,27 +25,39 @@ This isn't a from-scratch project. The mechanical foundation — a working `pre_
 - STA config: `/openlane/pre_sta.conf`
 - Reports: `/openlane/reports/`
 
-`[SCREENSHOT: terminal showing docker exec -it zealous_kapitsa bash and the resulting OpenLane container prompt]`
+
 
 ---
 
-## 2. Auditing and Extending the SDC
+## 2. Timing Constraints — What an SDC Actually Encodes
 
-Before writing anything new, the existing `my_base.sdc` was dumped and checked against five required constraint types: clock definition, I/O delay, clock uncertainty, false path, and multicycle path.
+An SDC (Synopsys Design Constraints) file is how a designer tells the STA tool what the design is *supposed* to do, since the tool has no way to infer intent from a netlist alone — it only sees gates and wires. Every line in `my_base.sdc` answers one specific question the tool would otherwise get wrong:
+
+- **Clock definition** (`create_clock`) — without this, the tool doesn't even know a clock exists, let alone its period. This is the single constraint everything else is measured against.
+- **Input/output delay** (`set_input_delay` / `set_output_delay`) — a chip's inputs and outputs connect to *other* chips or logic outside this block. These constraints model the delay already "used up" before a signal reaches this design's boundary (or after it leaves), so the tool doesn't pretend the whole clock period is available for internal logic alone. Here they're set to 20% of the clock period — a common rule-of-thumb budget.
+- **Clock uncertainty** (`set_clock_uncertainty`) — real clocks never arrive at exactly the same instant every cycle. Jitter (electrical noise on the clock source) and skew (different wire delay to different flip-flops) eat into the usable timing window. This constraint reserves a margin (0.2ns here) so the tool doesn't over-promise timing that jitter/skew would actually break.
+- **False path** (`set_false_path`) — some paths in a netlist are timing paths in the tool's eyes but never mattered functionally. `resetn` here is asynchronous — it's not meant to be sampled on a clock edge in the first place — so constraining it to normal setup/hold rules would either be meaninglessly strict or actively wrong. Marking it false path tells the tool to simply not analyze it.
+- **Multicycle path** (`set_multicycle_path`) — the default assumption in STA is that every path must complete in *one* clock cycle. Some paths are architecturally allowed more time (e.g. a slow arithmetic result that's only consumed two cycles later). This constraint relaxes the one-cycle default for a specific, named path — but only when a real path is named; more on this below.
+
+Before writing anything new, the existing `my_base.sdc` was audited against all five of these:
 
 ```bash
 cat /openlane/designs/picorv32a/src/my_base.sdc
 ```
 
-All five were already present:
+All five constraint types were already present in some form. Four were fully correct and usable as-is. The fifth — the multicycle path — was a **placeholder**: it referenced `mem_wstrb_reg/Q` and `mem_addr_reg/D`, register names that sounded architecturally reasonable (write-strobe feeding an address register) but didn't actually exist anywhere in the synthesized netlist. OpenSTA caught this immediately and printed a warning rather than silently ignoring it or crashing — a reminder that a multicycle (or false path) constraint pointing at the wrong pins isn't just cosmetically wrong, it means the intended relaxation never actually applies to any real path. This was fixed properly in Section 6, once a real register pair was available from an actual timing report.
 
-| Constraint type | Status | Line |
-|---|---|---|
-| Clock definition | ✅ | `create_clock ... -period $::env(CLOCK_PERIOD)` |
-| Input/output delay | ✅ | `set_input_delay` / `set_output_delay` at 20% of period |
-| Clock uncertainty | ✅ | `set_clock_uncertainty 0.2 [get_clocks $::env(CLOCK_PORT)]` |
-| False path | ✅ | `set_false_path -from [get_ports resetn]` — resetn is asynchronous |
-| Multicycle path | ⚠️ placeholder | referenced `mem_wstrb_reg/Q` → `mem_addr_reg/D`, pins that don't exist in the actual netlist — fixed in Section 6 once real register names were available |
+---
+
+## 3. STA Fundamentals Used Throughout This Study
+
+A few concepts recur across every report in this project, so it's worth being precise about what each one means:
+
+- **Setup check** — for a flip-flop to correctly capture data, that data has to arrive and *settle* before the next clock edge, with some margin to spare. STA checks this on every register-to-register path in the design.
+- **Slack** — the margin itself: `slack = data required time − data arrival time`. Positive slack means the path finishes early enough (`MET`); negative slack means it doesn't (`VIOLATED`).
+- **WNS (Worst Negative Slack)** — the single worst (most negative) slack value found anywhere in the design. One number, one path — the design's single biggest bottleneck.
+- **TNS (Total Negative Slack)** — the *sum* of every violating path's negative slack, across the whole design. Where WNS tells you how bad the worst offender is, TNS tells you how widespread the problem is — a small WNS with a huge TNS means many paths are all failing by a little, not just one badly.
+- **Critical path** — the specific path responsible for WNS. This is what `report_checks -path_delay max` prints: every cell the signal passes through, with per-stage delay, so the actual bottleneck can be identified and reasoned about instead of just seeing a slack number.
 
 ---
 
@@ -66,7 +77,7 @@ sta -exit pre_sta.conf > /openlane/reports/timing_20ns.rpt
 # repeated for 10.000, 8.000, 5.000, 3.000
 ```
 
-`[SCREENSHOT: terminal showing the sed + sta command pair for at least one clock period]`
+
 
 ### Result — the 20ns "safe" clock still violates
 
@@ -83,7 +94,7 @@ Path Type: max
                                  -2.95   slack (VIOLATED)
 ```
 
-`[SCREENSHOT: full timing_20ns.rpt critical path, from Startpoint to slack VIOLATED]`
+![20ns baseline critical path — slack VIOLATED](02_sta.png)
 
 ---
 
@@ -102,7 +113,7 @@ grep -H "wns\|tns" /openlane/reports/timing_20ns.rpt /openlane/reports/timing_10
 | 5ns | -17.95 | -4582.96 |
 | 3ns | -19.95 | -7523.19 |
 
-`[SCREENSHOT: terminal output of the grep command above, showing all five WNS/TNS pairs]`
+![WNS/TNS across all five clock periods](03_sta.png)
 
 All five results are internally consistent with a single fixed 22.45ns critical path — WNS drops by almost exactly the same amount the clock period does at each step, confirming the same bottleneck is dominating at every speed.
 
@@ -143,11 +154,16 @@ tns -28.52
 wns -2.95
 ```
 
-`[SCREENSHOT: final my_base.sdc contents + the rerun confirming no pin-not-found warnings]`
+![Multicycle path fix confirmed + final my_base.sdc](01_sta.png)
 
 ---
 
 ## 7. Timing Closure — Two Techniques, Tested Independently
+
+Timing closure generally comes from one of two directions: changing the **logic** (fewer/faster gates, restructured Boolean expressions) or changing the **physical implementation** (where cells sit, how they're wired) without touching logic at all. The two techniques below were deliberately chosen to represent one of each, so the case study shows which *category* of fix actually mattered for this specific violation.
+
+- **SYNTH_STRATEGY** controls how Yosys' internal optimizer (ABC) maps generic logic onto the standard cell library during synthesis. Strategies biased toward "AREA" pick the smallest cells and accept more logic levels; strategies biased toward "DELAY" pick faster (often larger) cell variants and restructure Boolean expressions to shorten the longest logic chain, at the cost of using more silicon area.
+- **PL_TARGET_DENSITY** controls how tightly the placer packs standard cells into the core area during global placement. A high density (cells close together, little free space) minimizes chip area but leaves the placer and router little room to maneuver, which can lengthen wires and increase congestion. A lower density gives more breathing room, generally shortening wires and reducing capacitance-driven delay — but it does nothing to the logic itself.
 
 Both techniques were applied to **separate, isolated OpenLane runs** (`prep -design picorv32a -tag <name> -overwrite`), each re-run from synthesis through CTS, so their effects could be measured independently against the same 20ns baseline rather than compounding on top of each other.
 
@@ -162,7 +178,7 @@ run_placement
 run_cts
 ```
 
-`[SCREENSHOT: terminal showing the full run_synthesis → run_cts sequence completing cleanly]`
+![Technique 1 — full prep through CTS command sequence](04_sta.png)
 
 `pre_sta.conf` was repointed at the new run's netlist and STA rerun:
 
@@ -185,7 +201,9 @@ wns 0.00
 
 The critical path's data arrival time dropped from **22.45ns → 14.51ns**. `SYNTH_STRATEGY="DELAY 3"` tells Yosys to prioritize speed over area during technology mapping — it picks faster gate variants and restructures logic to shorten the critical path, fixing the violation at the logic-structure level, before placement even happens.
 
-`[SCREENSHOT: full after_synth_strategy.rpt critical path showing slack MET, plus the wns/tns = 0.00 result]`
+![Technique 1 result — wns/tns 0.00](05_sta.png)
+
+![Technique 1 critical path — slack MET](06_sta.png)
 
 ### Technique 2 — Placement density (physical-level fix)
 
@@ -198,7 +216,7 @@ run_placement
 run_cts
 ```
 
-`[SCREENSHOT: terminal showing the set PL_TARGET_DENSITY command and run_placement/run_cts completing cleanly]`
+
 
 ```bash
 sta -exit pre_sta.conf > /openlane/reports/after_density_change.rpt
@@ -213,7 +231,7 @@ wns -2.95
 
 Checking the actual critical path confirmed this wasn't a fluke — it's the **identical path**, same instance names (`_29443_`, `_28171_`, etc.), same delay values down to the hundredth of a nanosecond, as the untouched baseline. Lowering placement density gives the placer more room and can shorten wire lengths, but it does nothing to a violation whose bottleneck is *logic depth*, not *interconnect delay*. Spreading cells out doesn't shorten a 33-stage combinational chain.
 
-`[SCREENSHOT: after_density_change.rpt critical path, showing it's identical to the baseline]`
+![Technique 2 result — unchanged, slack VIOLATED](07_sta.png)
 
 ---
 
@@ -266,11 +284,11 @@ The dominant setup violation runs from `_28783_` to `_28171_`, both flip-flops c
 
 ## 12. Deliverables in This Repo
 
-- `sdc/my_base.sdc` — final extended SDC (clock, I/O delay, uncertainty, false path, multicycle path with real pin names)
-- `reports/timing_20ns.rpt`, `timing_10ns.rpt`, `timing_8ns.rpt`, `timing_5ns.rpt`, `timing_3ns.rpt` — raw STA reports for all five clock periods
-- `reports/after_synth_strategy.rpt` — STA after Technique 1
-- `reports/after_density_change.rpt` — STA after Technique 2
-- `screenshots/` — terminal evidence for each step above
+- `my_base.sdc` — final extended SDC (clock, I/O delay, uncertainty, false path, multicycle path with real pin names)
+- `timing_20ns.rpt`, `timing_10ns.rpt`, `timing_8ns.rpt`, `timing_5ns.rpt`, `timing_3ns.rpt` — raw STA reports for all five clock periods
+- `after_synth_strategy.rpt` — STA after Technique 1
+- `after_density_change.rpt` — STA after Technique 2
+- `01_sta.png` – `07_sta.png` — terminal evidence for each step above
 - This README
 
 ---
